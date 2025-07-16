@@ -35,7 +35,11 @@ def load_gsc_export(uploaded_file):
     """Return dict of DataFrames keyed by uppercase sheet name."""
     fname = uploaded_file.name.lower()
     if fname.endswith((".xls", ".xlsx")):
-        xls = pd.ExcelFile(uploaded_file)
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+        except ImportError:
+            st.error("Excel support requires **openpyxl**. Add it to requirements.txt or `pip install openpyxl`.")
+            return {}
         return {name.upper(): xls.parse(name) for name in xls.sheet_names}
 
     # CSV / TSV – treat whole file as QUERIES sheet
@@ -127,16 +131,34 @@ def run_opportunity_finder():
 # YoY Page Analysis
 ###############################################################################
 
-def parse_period_columns(df):
-    """Map metrics to newest/oldest columns and add *_new / *_old normalized fields."""
+def _extract_year(col: str) -> int:
+    """Return 4‑digit year from column label or 0 if not present."""
+    m = re.search(r"(\d{4})", col)
+    return int(m.group(1)) if m else 0
+
+
+def parse_period_columns(df: pd.DataFrame):
+    """
+    Identify the newest vs. older columns for each metric (Clicks, Impressions, CTR, Position).
+    Works even when year is missing by falling back to the original order.
+    Adds normalized columns: metric_new, metric_old.
+    """
     metrics = ["Clicks", "Impressions", "CTR", "Position"]
+
     for metric in metrics:
-        cols = [c for c in df.columns if str(c).strip().endswith(metric)]
+        # columns like "Clicks", "Clicks (previous period)", "Clicks 2024‑07‑16", etc.
+        cols = [c for c in df.columns if str(c).strip().lower().startswith(metric.lower())]
         if len(cols) < 2:
-            continue  # not found
-        # Sort by year extracted from column name (YYYY)
-        cols_sorted = sorted(cols, key=lambda c: int(re.search(r"(\d{4})", str(c)).group(1)), reverse=True)
-        new_col, old_col = cols_sorted[:2]
+            continue  # can't calc delta
+
+        # Try to sort by embedded year; fallback to order of appearance
+        years = [_extract_year(str(c)) for c in cols]
+        if all(y == 0 for y in years):
+            new_col, old_col = cols[:2]
+        else:
+            cols_sorted = sorted(cols, key=lambda c: _extract_year(str(c)), reverse=True)
+            new_col, old_col = cols_sorted[:2]
+
         df[f"{metric.lower()}_new"] = pd.to_numeric(df[new_col], errors="coerce")
         df[f"{metric.lower()}_old"] = pd.to_numeric(df[old_col], errors="coerce")
 
@@ -161,20 +183,24 @@ def run_yoy_analysis():
         st.error("Expected both 'Queries' and 'Pages' tabs – make sure you exported the full report.")
         return
 
-    # Page selector (supports multi‑page export but warns)
+    # Page selector
     pages_df = sheets["PAGES"]
     page_urls = pages_df.iloc[:, 0].astype(str).tolist()
-    page = st.selectbox("Select page URL", page_urls)
+    st.selectbox("Select page URL", page_urls, key="page_selector")
     if len(page_urls) > 1:
-        st.warning("Export contains multiple pages – results will include all queries unless you filter the export to a single URL.")
+        st.warning("Export contains multiple pages – ensure you filtered the export to a single URL for precise query attribution.")
 
     qdf = sheets["QUERIES"].copy()
+    # Standardize query col name
+    if "Top queries" in qdf.columns and "query" not in qdf.columns:
+        qdf = qdf.rename(columns={"Top queries": "query"})
+
     parse_period_columns(qdf)
 
     needed = [f"{m}_new" for m in ("clicks", "impressions", "ctr", "position")] + \
              [f"{m}_old" for m in ("clicks", "impressions", "ctr", "position")]
     if not all(col in qdf.columns for col in needed):
-        st.error("Could not detect both period columns for Clicks, Impressions, CTR, and Position.")
+        st.error("Could not detect both period columns for Clicks, Impressions, CTR, and Position. Double‑check the export mode (Compare → YoY).")
         return
 
     # Compute deltas
@@ -188,6 +214,8 @@ def run_yoy_analysis():
     q["impr_effect"] = q["impressions_diff"] * q["ctr_old"]
     q["ctr_effect"] = q["clicks_old"] * q["ctr_diff"]
     q["interaction_effect"] = q["impressions_diff"] * q["ctr_diff"]
+
+    # Predicted click change (sanity‑check)
     q["clicks_pred_diff"] = q[["impr_effect", "ctr_effect", "interaction_effect"]].sum(axis=1)
 
     def classify(row):
@@ -211,13 +239,11 @@ def run_yoy_analysis():
 
     # Table of movers
     movers = q.sort_values("clicks_diff", ascending=False)
-    rename_cols = {"Top queries": "query"} if "Top queries" in movers.columns else {}
-    movers = movers.rename(columns=rename_cols)
 
     st.subheader("Query‑level changes")
     st.dataframe(
         movers[[
-            movers.columns[0],  # query column (either 'query' or 'Top queries')
+            "query",
             "clicks_new", "clicks_old", "clicks_diff",
             "impressions_new", "impressions_old", "impressions_diff",
             "ctr_new", "ctr_old", "ctr_diff",
